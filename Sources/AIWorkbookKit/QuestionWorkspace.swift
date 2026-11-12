@@ -106,10 +106,18 @@ private struct QuestionDetailView: View {
     @State private var selectedPageID: UUID?
     @State private var showsQuestion = true
     @State private var showsCropEditor = false
-    @State private var showsFullPreview = false
+    @State private var activePreview: Preview?
+    @State private var isFullScreen = false
+    @State private var fitWidthRequest = 0
     @State private var showsRename = false
     @State private var draftTitle = ""
     @State private var errorMessage: String?
+
+    private enum Preview: String, Identifiable {
+        case cropped, source
+
+        var id: Self { self }
+    }
 
     var body: some View {
         if let question = store.questions.first(where: { $0.id == questionID }),
@@ -117,6 +125,7 @@ private struct QuestionDetailView: View {
             answer(for: question, sourcePage: sourcePage)
                 .navigationTitle(question.title)
                 .navigationBarTitleDisplayMode(.inline)
+                .toolbar(isFullScreen ? .hidden : .visible, for: .navigationBar)
                 .toolbar {
                     ToolbarItem(placement: .primaryAction) {
                         Menu {
@@ -141,14 +150,21 @@ private struct QuestionDetailView: View {
                         try store.updateCrop(questionID, crop: crop)
                     }
                 }
-                .fullScreenCover(isPresented: $showsFullPreview) {
+                .fullScreenCover(item: $activePreview) { preview in
                     NavigationStack {
-                        QuestionCropPreview(page: sourcePage, crop: question.crop, allowsZoom: true)
+                        Group {
+                            switch preview {
+                            case .cropped:
+                                QuestionCropPreview(page: sourcePage, crop: question.crop, allowsZoom: true)
+                            case .source:
+                                QuestionSourcePreview(page: sourcePage)
+                            }
+                        }
                             .navigationTitle(question.title)
                             .navigationBarTitleDisplayMode(.inline)
                             .toolbar {
                                 ToolbarItem(placement: .confirmationAction) {
-                                    Button("完成") { showsFullPreview = false }
+                                    Button("完成") { activePreview = nil }
                                 }
                             }
                     }
@@ -173,33 +189,51 @@ private struct QuestionDetailView: View {
     private func answer(for question: WorkbookQuestion, sourcePage: PDFPage) -> some View {
         GeometryReader { geometry in
             VStack(spacing: 10) {
-                questionPreview(for: question, sourcePage: sourcePage,
-                                height: min(420, geometry.size.height * 0.40))
+                if isFullScreen {
+                    HStack {
+                        Button {
+                            isFullScreen = false
+                        } label: {
+                            Label("退出全屏", systemImage: "arrow.down.right.and.arrow.up.left")
+                        }
+                        Spacer()
+                        Button("查看题目") { activePreview = .cropped }
+                    }
+                    .buttonStyle(.bordered)
+                    .padding(.horizontal)
+                } else {
+                    let ratio = QuestionCropPreview.aspectRatio(page: sourcePage, crop: question.crop)
+                    let naturalHeight = max(1, geometry.size.width - 32) / ratio
+                    let availableHeight = geometry.size.height * 0.40
+                    questionPreview(for: question, sourcePage: sourcePage,
+                                    height: min(max(110, naturalHeight), max(110, availableHeight)))
+                        .padding(.horizontal)
+                }
                 answerSheet(for: question)
             }
-            .padding()
+            .padding(.top, 8)
         }
     }
 
     private func questionPreview(for question: WorkbookQuestion, sourcePage: PDFPage,
                                  height: CGFloat) -> some View {
         DisclosureGroup(isExpanded: $showsQuestion) {
-            Button {
-                showsFullPreview = true
-            } label: {
-                VStack(alignment: .trailing, spacing: 6) {
-                    QuestionCropPreview(page: sourcePage, crop: question.crop)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: height)
-                        .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+            VStack(alignment: .trailing, spacing: 6) {
+                QuestionCropPreview(page: sourcePage, crop: question.crop,
+                                    onOpen: { activePreview = .cropped },
+                                    onViewSource: { activePreview = .source },
+                                    onRecrop: { showsCropEditor = true })
+                    .frame(maxWidth: .infinity)
+                    .frame(height: height)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                Button {
+                    activePreview = .cropped
+                } label: {
                     Label("全屏查看", systemImage: "arrow.up.left.and.arrow.down.right")
                         .font(.footnote)
-                        .foregroundStyle(.tint)
                 }
-                .contentShape(Rectangle())
+                .accessibilityLabel("全屏查看题目")
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("全屏查看题目")
             .padding(.top, 6)
         } label: {
             Text("题目截图 · 原 PDF 第 \(question.sourcePageIndex + 1) 页")
@@ -232,6 +266,18 @@ private struct QuestionDetailView: View {
 
                 Spacer()
                 Button {
+                    fitWidthRequest += 1
+                } label: {
+                    Label("适合宽度", systemImage: "arrow.left.and.right").labelStyle(.iconOnly)
+                }
+                if !isFullScreen {
+                    Button {
+                        isFullScreen = true
+                    } label: {
+                        Label("全屏作答", systemImage: "arrow.up.left.and.arrow.down.right")
+                    }
+                }
+                Button {
                     do {
                         selectedPageID = try store.addContinuation(to: questionID)
                     } catch {
@@ -242,10 +288,13 @@ private struct QuestionDetailView: View {
                 }
                 .buttonStyle(.bordered)
             }
+            .padding(.horizontal)
 
             let sheet = pages[currentIndex]
             if let file = try? store.drawingURL(questionID: questionID, answerPageID: sheet.id) {
-                QuestionAnswerCanvas(fileURL: file)
+                QuestionAnswerCanvas(fileURL: file,
+                                     showsTools: activePreview == nil && !showsCropEditor && !showsRename,
+                                     fitWidthRequest: fitWidthRequest)
                     .id(sheet.id)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {

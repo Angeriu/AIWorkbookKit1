@@ -335,60 +335,77 @@ struct PDFPagePreview: UIViewRepresentable {
     }
 }
 
+@MainActor
 struct HandwritingCanvas: UIViewRepresentable {
     let fileURL: URL
+    @Environment(\.scenePhase) private var scenePhase
     
     func makeCoordinator() -> Coordinator {
         Coordinator(fileURL: fileURL)
     }
     
     func makeUIView(context: Context) -> PKCanvasView {
-        let canvas = PKCanvasView()
+        let canvas = WorkbookPencilCanvas(frame: .zero)
         canvas.backgroundColor = .white
         canvas.isOpaque = true
+        canvas.overrideUserInterfaceStyle = .light
         canvas.drawingPolicy = .pencilOnly
         canvas.isScrollEnabled = false
+        canvas.contentInsetAdjustmentBehavior = .never
         if let data = try? Data(contentsOf: fileURL),
            let restoredDrawing = try? PKDrawing(data: data) {
             canvas.drawing = restoredDrawing
         }
+        context.coordinator.lastSavedDrawing = canvas.drawing
         canvas.delegate = context.coordinator
         
-        let picker = context.coordinator.toolPicker
-        if let ink = picker.selectedToolItem as? PKToolPickerInkingItem {
-            canvas.tool = ink.inkingTool
-        }
+        let pressurePen = context.coordinator.pressurePen
+        pressurePen.attach(to: canvas, onDrawingChange: { [weak coordinator = context.coordinator] canvas in
+            coordinator?.canvasViewDrawingDidChange(canvas)
+        })
+        let picker = pressurePen.toolPicker
         picker.addObserver(canvas)
         DispatchQueue.main.async {
             guard canvas.delegate != nil else { return }
-            canvas.becomeFirstResponder()
             picker.setVisible(true, forFirstResponder: canvas)
+            canvas.becomeFirstResponder()
         }
         return canvas
     }
     
-    func updateUIView(_ view: PKCanvasView, context: Context) { }
+    func updateUIView(_ view: PKCanvasView, context: Context) {
+        if scenePhase != .active {
+            context.coordinator.pressurePen.flush()
+            context.coordinator.canvasViewDrawingDidChange(view)
+        }
+    }
 
     static func dismantleUIView(_ view: PKCanvasView, coordinator: Coordinator) {
+        coordinator.pressurePen.detach()
+        coordinator.canvasViewDrawingDidChange(view)
         view.delegate = nil
-        coordinator.toolPicker.setVisible(false, forFirstResponder: view)
-        coordinator.toolPicker.removeObserver(view)
+        let picker = coordinator.pressurePen.toolPicker
+        picker.setVisible(false, forFirstResponder: view)
+        picker.removeObserver(view)
         view.resignFirstResponder()
     }
     
     @MainActor
     final class Coordinator: NSObject, PKCanvasViewDelegate {
         let fileURL: URL
-        let toolPicker = WorkbookPen.makeToolPicker()
+        let pressurePen = WorkbookPressurePen()
+        var lastSavedDrawing: PKDrawing?
         
         init(fileURL: URL) {
             self.fileURL = fileURL
         }
         
         func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
+            let drawing = canvasView.drawing
+            guard drawing != lastSavedDrawing else { return }
             do {
-                try canvasView.drawing.dataRepresentation()
-                    .write(to: fileURL, options: .atomic)
+                try drawing.dataRepresentation().write(to: fileURL, options: .atomic)
+                lastSavedDrawing = drawing
             } catch {
                 print("Failed to save handwriting: \(error)")
             }
