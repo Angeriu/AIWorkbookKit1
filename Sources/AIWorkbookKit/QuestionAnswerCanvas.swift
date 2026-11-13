@@ -97,7 +97,7 @@ private final class AnswerDrawingSnapshot {
 }
 
 @MainActor
-private enum AnswerDrawingFiles {
+enum AnswerDrawingFiles {
     // Retain the latest unsaved drawing if its canvas is closed before a retry.
     private static var pending: [URL: PKDrawing] = [:]
 
@@ -232,7 +232,7 @@ private struct AnswerCanvasHost: UIViewRepresentable {
 
 @MainActor
 private final class AnswerSheetScrollView: UIScrollView, UIScrollViewDelegate {
-    private static let sheetSize = CGSize(width: 768, height: 1_024)
+    private static let sheetSize = WorkbookAnswerPaper.size
     let canvas: PKCanvasView
     private let paper: RuledAnswerPaper
     private let pressurePen = WorkbookPressurePen()
@@ -384,15 +384,27 @@ private final class AnswerSheetScrollView: UIScrollView, UIScrollViewDelegate {
 private final class RuledAnswerPaper: UIView {
     override func draw(_ rect: CGRect) {
         guard let context = UIGraphicsGetCurrentContext() else { return }
+        WorkbookAnswerPaper.draw(in: context, rect: bounds)
+    }
+}
+
+@MainActor
+enum WorkbookAnswerPaper {
+    static let size = CGSize(width: 768, height: 1_024)
+
+    static func draw(in context: CGContext, rect: CGRect) {
+        context.saveGState()
         context.setFillColor(UIColor(red: 0.98, green: 0.97, blue: 0.92, alpha: 1).cgColor)
         context.fill(rect)
         context.setStrokeColor(UIColor(red: 0.77, green: 0.80, blue: 0.82, alpha: 1).cgColor)
         context.setLineWidth(0.75)
-        for y in stride(from: 32, to: Int(bounds.height), by: 32) {
-            context.move(to: CGPoint(x: 0, y: CGFloat(y)))
-            context.addLine(to: CGPoint(x: bounds.width, y: CGFloat(y)))
+        for offset in stride(from: 32, to: Int(rect.height), by: 32) {
+            let y = rect.minY + CGFloat(offset)
+            context.move(to: CGPoint(x: rect.minX, y: y))
+            context.addLine(to: CGPoint(x: rect.maxX, y: y))
         }
         context.strokePath()
+        context.restoreGState()
     }
 }
 

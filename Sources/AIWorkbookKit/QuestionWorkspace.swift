@@ -1,5 +1,6 @@
 import PDFKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Open this workspace for the already imported local PDF. Reuse that PDF's
 /// persisted key every time it is restored. The key identifies one immutable copy.
@@ -7,15 +8,20 @@ import SwiftUI
 struct QuestionWorkspace: View {
     let document: PDFDocument
     let sourcePageIndex: Int
+    let title: String
 
     @Environment(\.dismiss) private var dismiss
     @StateObject private var store: QuestionStore
     @State private var showsCropEditor = false
     @State private var errorMessage: String?
+    @State private var isPreparingExport = false
+    @State private var showsExporter = false
+    @State private var exportDocument: WorkbookPDFFile?
 
-    init(document: PDFDocument, documentKey: String, sourcePageIndex: Int) {
+    init(document: PDFDocument, documentKey: String, sourcePageIndex: Int, title: String) {
         self.document = document
         self.sourcePageIndex = sourcePageIndex
+        self.title = title
         _store = StateObject(wrappedValue: QuestionStore(documentKey: documentKey,
                                                         pageCount: document.pageCount))
     }
@@ -37,13 +43,22 @@ struct QuestionWorkspace: View {
                     questionList
                 }
             }
+            .disabled(isPreparingExport)
+            .overlay {
+                if isPreparingExport {
+                    ProgressView("正在生成 PDF…")
+                        .padding()
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+            }
             .navigationTitle("逐题作答")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("返回原 PDF") { dismiss() }
+                        .disabled(isPreparingExport)
                 }
                 ToolbarItem(placement: .primaryAction) {
-                    if store.questions.count > 1 { EditButton() }
+                    if store.questions.count > 1 { EditButton().disabled(isPreparingExport) }
                 }
             }
             .task { store.loadIfNeeded() }
@@ -55,6 +70,9 @@ struct QuestionWorkspace: View {
                 }
             }
             .questionError($errorMessage)
+            .fileExporter(isPresented: $showsExporter, document: exportDocument, contentTypes: [.pdf],
+                          defaultFilename: exportFilename, onCompletion: finishExport,
+                          onCancellation: { exportDocument = nil })
         }
     }
 
@@ -70,6 +88,11 @@ struct QuestionWorkspace: View {
             if store.questions.isEmpty {
                 Text("框选并保存一道题，即可开始书写。")
                     .foregroundStyle(.secondary)
+            } else {
+                Button(action: prepareExport) {
+                    Label("导出作答 PDF", systemImage: "square.and.arrow.up")
+                }
+                .disabled(isPreparingExport || showsExporter)
             }
 
             ForEach(store.questions) { question in
@@ -94,6 +117,57 @@ struct QuestionWorkspace: View {
                 }
             }
         }
+    }
+
+    private var exportFilename: String {
+        let separators = CharacterSet(charactersIn: "/\\:").union(.controlCharacters)
+        let sourceName = (title as NSString).deletingPathExtension
+        let cleanName = sourceName.components(separatedBy: separators).joined(separator: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = cleanName.isEmpty ? "AI Workbook" : String(cleanName.prefix(80))
+        return "\(base)-作答"
+    }
+
+    private func prepareExport() {
+        guard case .ready = store.loadState, !store.questions.isEmpty,
+              !isPreparingExport, !showsExporter else { return }
+        let questions = store.questions
+        isPreparingExport = true
+        Task { @MainActor in
+            await Task.yield()
+            defer { isPreparingExport = false }
+            do {
+                let data = try WorkbookPDFExport.render(document: document, questions: questions) { questionID, sheetID in
+                    let url = try store.drawingURL(questionID: questionID, answerPageID: sheetID)
+                    return try AnswerDrawingFiles.read(url.standardizedFileURL)
+                }
+                exportDocument = WorkbookPDFFile(data: data)
+                showsExporter = true
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func finishExport(_ result: Result<URL, Error>) {
+        exportDocument = nil
+        if case .failure(let error) = result { errorMessage = error.localizedDescription }
+    }
+}
+
+private struct WorkbookPDFFile: FileDocument {
+    static let readableContentTypes: [UTType] = [.pdf]
+    let data: Data
+
+    init(data: Data) { self.data = data }
+
+    init(configuration: ReadConfiguration) throws {
+        guard let data = configuration.file.regularFileContents else { throw CocoaError(.fileReadCorruptFile) }
+        self.data = data
+    }
+
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        FileWrapper(regularFileWithContents: data)
     }
 }
 
