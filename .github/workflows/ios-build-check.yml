@@ -16,20 +16,41 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Check both released versions with the iOS SDK
+      - name: Compile and link both versions against the iOS 26.0 SDK
         shell: bash
         run: |
+          export DEVELOPER_DIR=/Applications/Xcode_26.0.1.app/Contents/Developer
           xcodebuild -version
           sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphoneos swiftc --version
+          scratch=$(mktemp -d)
+          cat > "$scratch/MyApp.swift" <<'SWIFT'
+          import SwiftUI
+
+          @main
+          struct MyApp: App {
+              var body: some Scene {
+                  WindowGroup { ContentView() }
+              }
+          }
+          SWIFT
           failed=0
           for tag in 0.2.0 0.2.1; do
             echo "::group::AIWorkbookKit $tag"
             git checkout --detach "$tag"
-            if xcrun --sdk iphoneos swiftc -typecheck -swift-version 5 \
+            output="$scratch/$tag"
+            mkdir "$output"
+            if xcrun --sdk iphoneos swiftc -emit-module -emit-object -parse-as-library \
+              -whole-module-optimization -swift-version 5 \
               -target arm64-apple-ios26.0 -sdk "$sdk" -module-name AIWorkbookKit \
               -Xfrontend -warn-long-expression-type-checking=500 \
-              Sources/AIWorkbookKit/*.swift; then
-              echo "$tag passed"
+              -emit-module-path "$output/AIWorkbookKit.swiftmodule" \
+              -o "$output/AIWorkbookKit.o" Sources/AIWorkbookKit/*.swift && \
+              xcrun --sdk iphoneos swiftc -swift-version 5 -target arm64-apple-ios26.0 \
+              -sdk "$sdk" -I "$output" -o "$output/AIWorkbook" \
+              "$scratch/MyApp.swift" Integration/ContentView.swift "$output/AIWorkbookKit.o"; then
+              echo "$tag compiled and linked"
             else
               failed=1
             fi
