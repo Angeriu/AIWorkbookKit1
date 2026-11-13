@@ -376,14 +376,14 @@ struct HandwritingCanvas: UIViewRepresentable {
     func updateUIView(_ view: PKCanvasView, context: Context) {
         if scenePhase != .active {
             context.coordinator.pressurePen.flush()
-            context.coordinator.canvasViewDrawingDidChange(view)
+            context.coordinator.flushSave(from: view)
         }
     }
 
     static func dismantleUIView(_ view: PKCanvasView, coordinator: Coordinator) {
         coordinator.pressurePen.detach()
-        coordinator.canvasViewDrawingDidChange(view)
         view.delegate = nil
+        coordinator.flushSave(from: view)
         let picker = coordinator.pressurePen.toolPicker
         picker.setVisible(false, forFirstResponder: view)
         picker.removeObserver(view)
@@ -395,12 +395,29 @@ struct HandwritingCanvas: UIViewRepresentable {
         let fileURL: URL
         let pressurePen = WorkbookPressurePen()
         var lastSavedDrawing: PKDrawing?
+        private let saveSchedule = DrawingSaveSchedule()
         
         init(fileURL: URL) {
             self.fileURL = fileURL
         }
         
         func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
+            saveSchedule.schedule { [weak self, weak canvasView] in
+                guard let self, let canvasView else { return }
+                self.writeLatestDrawing(from: canvasView)
+            }
+        }
+
+        func canvasViewDidFinishRendering(_ canvasView: PKCanvasView) {
+            pressurePen.canvasDidFinishRendering(canvasView)
+        }
+
+        func flushSave(from canvasView: PKCanvasView) {
+            saveSchedule.cancel()
+            writeLatestDrawing(from: canvasView)
+        }
+
+        private func writeLatestDrawing(from canvasView: PKCanvasView) {
             let drawing = canvasView.drawing
             guard drawing != lastSavedDrawing else { return }
             do {
