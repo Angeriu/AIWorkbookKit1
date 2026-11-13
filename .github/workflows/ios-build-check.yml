@@ -1,4 +1,4 @@
-name: Diagnose iPad package build
+name: Check iPad package candidate
 
 on:
   push:
@@ -16,8 +16,10 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Compile and link both versions against the iOS 26.0 SDK
+      - name: Compile and link the candidate against the iOS 26.0 SDK
         shell: bash
+        env:
+          CANDIDATE_COMMIT: ac8a30ac6d69b60dfd585b60adcc4f9caafcb1fc
         run: |
           export DEVELOPER_DIR=/Applications/Xcode_26.0.1.app/Contents/Developer
           xcodebuild -version
@@ -25,6 +27,15 @@ jobs:
           xcrun --sdk iphoneos --show-sdk-version
           xcrun --sdk iphoneos swiftc --version
           scratch=$(mktemp -d)
+          source="$scratch/source"
+          output="$scratch/output"
+          mkdir "$output"
+          git worktree add --detach "$source" "$CANDIDATE_COMMIT"
+          trap 'git worktree remove --force "$source"' EXIT
+          actual_commit=$(git -C "$source" rev-parse HEAD)
+          test "$actual_commit" = "$CANDIDATE_COMMIT"
+          echo "Checking AIWorkbookKit commit $actual_commit"
+          xcrun swift package --package-path "$source" dump-package
           cat > "$scratch/MyApp.swift" <<'SWIFT'
           import SwiftUI
 
@@ -35,25 +46,13 @@ jobs:
               }
           }
           SWIFT
-          failed=0
-          for tag in 0.2.0 0.2.1; do
-            echo "::group::AIWorkbookKit $tag"
-            git checkout --detach "$tag"
-            output="$scratch/$tag"
-            mkdir "$output"
-            if xcrun --sdk iphoneos swiftc -emit-module -emit-object -parse-as-library \
-              -whole-module-optimization -swift-version 5 \
-              -target arm64-apple-ios26.0 -sdk "$sdk" -module-name AIWorkbookKit \
-              -Xfrontend -warn-long-expression-type-checking=500 \
-              -emit-module-path "$output/AIWorkbookKit.swiftmodule" \
-              -o "$output/AIWorkbookKit.o" Sources/AIWorkbookKit/*.swift && \
-              xcrun --sdk iphoneos swiftc -swift-version 5 -target arm64-apple-ios26.0 \
-              -sdk "$sdk" -I "$output" -o "$output/AIWorkbook" \
-              "$scratch/MyApp.swift" Integration/ContentView.swift "$output/AIWorkbookKit.o"; then
-              echo "$tag compiled and linked"
-            else
-              failed=1
-            fi
-            echo '::endgroup::'
-          done
-          exit "$failed"
+          xcrun --sdk iphoneos swiftc -emit-module -emit-object -parse-as-library \
+            -whole-module-optimization -swift-version 5 \
+            -target arm64-apple-ios26.0 -sdk "$sdk" -module-name AIWorkbookKit \
+            -Xfrontend -warn-long-expression-type-checking=500 \
+            -emit-module-path "$output/AIWorkbookKit.swiftmodule" \
+            -o "$output/AIWorkbookKit.o" "$source"/Sources/AIWorkbookKit/*.swift
+          xcrun --sdk iphoneos swiftc -swift-version 5 -target arm64-apple-ios26.0 \
+            -sdk "$sdk" -I "$output" -o "$output/AIWorkbook" \
+            "$scratch/MyApp.swift" "$source/Integration/ContentView.swift" "$output/AIWorkbookKit.o"
+          echo "$actual_commit compiled and linked"
