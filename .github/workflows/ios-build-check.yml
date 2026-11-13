@@ -1,0 +1,38 @@
+name: Diagnose iPad package build
+
+on:
+  push:
+    branches: [diagnostics/ios-build-021]
+
+permissions:
+  contents: read
+
+jobs:
+  sdk-check:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check both released versions with the iOS SDK
+        shell: bash
+        run: |
+          xcodebuild -version
+          sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+          failed=0
+          for tag in 0.2.0 0.2.1; do
+            echo "::group::AIWorkbookKit $tag"
+            git checkout --detach "$tag"
+            if xcrun --sdk iphoneos swiftc -typecheck -swift-version 5 \
+              -target arm64-apple-ios26.0 -sdk "$sdk" -module-name AIWorkbookKit \
+              -Xfrontend -warn-long-expression-type-checking=500 \
+              Sources/AIWorkbookKit/*.swift; then
+              echo "$tag passed"
+            else
+              failed=1
+            fi
+            echo '::endgroup::'
+          done
+          exit "$failed"
