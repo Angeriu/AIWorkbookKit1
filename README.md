@@ -10,14 +10,14 @@
 | --- | --- | --- |
 | 1 · PDF 与整页书写 | 本地导入、翻页、Apple Pencil、按原页保存并恢复笔迹 | 原型已在 iPad 验证。升级后在原工程打开旧作业，可检查原页笔迹。 |
 | 2 · 逐题作答 | 手动框选、题目预览与编辑、独立答题纸、续页、本地保存 | `0.2.0` 可在原工程运行。`0.2.1` 的独立 iPad 工程已确认各项功能正常。原工程更新依赖后需复核旧作业。 |
-| 2 · 书写体验 | PDFKit 清晰预览、横线纸、全屏与缩放、自定义钢笔 | `0.2.1` 已发布。实时压感、清晰轮廓和抬笔衔接的改进已通过 iOS SDK 编译，仍需 iPad 快写与缩放验收。 |
-| 3 · 导出与手动提交 | 导出带题目和续页的作答 PDF，再到学校网页手动上传 | `2f733a4` 已通过 iOS 26 SDK 编译与 iPad 模拟器导出测试，待真机验收后发布。 |
+| 2 · 书写体验 | PDFKit 清晰预览、横线纸、全屏与缩放、自定义钢笔 | `0.2.1` 提供基础功能，`0.2.2` 改善实时压感、笔迹轮廓和抬笔衔接。改进已通过 iOS SDK 编译，待 iPad 快写与缩放验收。 |
+| 3 · 导出与手动提交 | 导出带题目和续页的作答 PDF，再到学校网页手动上传 | `0.2.2` 提供导出功能。已通过 iOS 26 SDK 编译与 iPad 模拟器导出测试，待真机保存和学校网页上传验收。 |
 | 4 · 辅助分题 | OCR 或版面识别提出题目范围，用户复核、调整并保存 | 待规划。先用实际作业评估扫描质量和分题准确率，继续提供手动框选。 |
 | 5 · 提交流程改进 | 根据实际学校平台补充上传指引、命名规则和提交结果提示 | 待确定目标平台和可用接口。先以手动上传完成提交。 |
 
 ## 导出逐题作答 PDF
 
-导出功能目前可在独立测试工程 `AIWorkbook Export Test.swiftpm` 中试用。模拟器已检查 A4 页尺寸、旋转页的偏移裁切、题目和续页顺序、笔迹位置以及笔迹读取失败提示。 [自动验证记录](https://github.com/Angeriu/AIWorkbookKit1/actions/runs/43380330469)
+将软件包更新到 `0.2.2` 即可在原工程使用导出。模拟器已检查 A4 页尺寸、旋转页的偏移裁切、题目和续页顺序、笔迹位置以及笔迹读取失败提示。 [自动验证记录](https://github.com/Angeriu/AIWorkbookKit1/actions/runs/43380330469)
 
 1. 打开一份样张，进入「逐题作答」。框选两道题，分别写几笔，再给其中一题加一张续页。
 2. 回到题目列表，按提交顺序排列题目，点「导出作答 PDF」并选保存位置。
@@ -35,20 +35,20 @@
 ## 首次接入原 iPad 工程
 
 1. 在 iPad 上打开原来的 AI Workbook 工程。点侧栏的添加按钮，选「Swift 软件包」，粘贴 `https://github.com/Angeriu/AIWorkbookKit1.git`。 [Swift Playgrounds 软件包说明](https://developer.apple.com/documentation/swift-playgrounds/add-a-swift-package)
-2. 选择 `0.2.1`，启用 `AIWorkbookKit` 产品，再添加到项目。若想接收 `0.2.x` 修订，版本规则可用「直到下一个次版本」。
+2. 选择 `0.2.2`，启用 `AIWorkbookKit` 产品，再添加到项目。若想接收 `0.2.x` 修订，版本规则可用「直到下一个次版本」。
 3. 用 [Integration/ContentView.swift](Integration/ContentView.swift) 的全文替换原工程的 `ContentView`。如果现有文件名是 `ContentView 1`，就在那个文件里替换内容。继续使用原工程的 `MyApp` 入口和 App 标识。
 4. 从原工程侧栏移除本地的 `QuestionStore`、`QuestionCropView`、`QuestionAnswerCanvas` 和 `QuestionWorkspace` Swift 源文件。工程里带 `1` 后缀的对应旧文件也可移除。运行时，`AIWorkbookView()` 会从原 App 的存储位置读取 PDF、题目和笔迹。
 
 ## 更新版本
 
-如果侧栏已经有 `AIWorkbookKit1`，打开软件包设置，选择要安装的 Git 标签，再运行原工程。若依赖固定在 `0.2.0`，请调整版本要求。App 入口继续调用 `AIWorkbookView()`。验收旧作业时使用原工程，独立测试工程适合导入样张。
+如果侧栏已经有 `AIWorkbookKit1`，在原工程打开软件包设置，选择 `0.2.2`，再运行原工程。App 入口继续调用 `AIWorkbookView()`。验收旧作业时使用原工程，独立测试工程适合导入样张。
 
 ## 发布现有 Git 标签
 
 在已有本地 Git 仓库的情况下，用实际仓库 URL 替换下面的占位符，再推送分支与标签。Git bundle 可通过 `git clone <bundle 文件路径> AIWorkbookKit` 恢复这份带标签的仓库。
 
 ```text
-git push --atomic <repository-url> main refs/tags/0.2.1
+git push --atomic <repository-url> main refs/tags/0.2.2
 ```
 
 ## 首次运行检查
