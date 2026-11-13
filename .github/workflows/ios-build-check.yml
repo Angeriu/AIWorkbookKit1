@@ -1,4 +1,4 @@
-name: Check iPad package candidate
+name: Check PDF export candidate
 
 on:
   push:
@@ -6,6 +6,9 @@ on:
 
 permissions:
   contents: read
+
+env:
+  CANDIDATE_COMMIT: 2f733a4c9b8c4684c78c1de3465dd39630f42fa2
 
 jobs:
   sdk-check:
@@ -18,8 +21,6 @@ jobs:
           persist-credentials: false
       - name: Compile and link the candidate against the iOS 26.0 SDK
         shell: bash
-        env:
-          CANDIDATE_COMMIT: ac8a30ac6d69b60dfd585b60adcc4f9caafcb1fc
         run: |
           export DEVELOPER_DIR=/Applications/Xcode_26.0.1.app/Contents/Developer
           xcodebuild -version
@@ -56,3 +57,50 @@ jobs:
             -sdk "$sdk" -I "$output" -o "$output/AIWorkbook" \
             "$scratch/MyApp.swift" "$source/Integration/ContentView.swift" "$output/AIWorkbookKit.o"
           echo "$actual_commit compiled and linked"
+
+  simulator-export:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Exercise PDF export on an iPad simulator
+        shell: bash
+        run: |
+          xcodebuild -version
+          scratch=$(mktemp -d)
+          source="$scratch/source"
+          git worktree add --detach "$source" "$CANDIDATE_COMMIT"
+          trap 'git worktree remove --force "$source"' EXIT
+          actual_commit=$(git -C "$source" rev-parse HEAD)
+          test "$actual_commit" = "$CANDIDATE_COMMIT"
+          echo "Testing AIWorkbookKit commit $actual_commit"
+          mkdir -p "$source/Tests/AIWorkbookKitTests"
+          cp Diagnostics/WorkbookPDFExportTests.swift "$source/Tests/AIWorkbookKitTests/"
+          python3 - "$source/Package.swift" <<'PYTHON'
+          from pathlib import Path
+          import sys
+          manifest = Path(sys.argv[1])
+          source = manifest.read_text()
+          target = '.target(name: "AIWorkbookKit")'
+          assert source.count(target) == 1
+          manifest.write_text(source.replace(target, target + ',\n        .testTarget(name: "AIWorkbookKitTests", dependencies: ["AIWorkbookKit"])'))
+          PYTHON
+          device_id=$(xcrun simctl list devices available --json | python3 -c '
+          import json, sys
+          devices = json.load(sys.stdin)["devices"]
+          for runtime in sorted(devices, key=lambda label: tuple(int(n) for n in label.split(".iOS-")[-1].split("-")) if ".iOS-" in label else (), reverse=True):
+              if ".iOS-" not in runtime:
+                  continue
+              for device in devices[runtime]:
+                  if device["name"].startswith("iPad"):
+                      print(device["udid"])
+                      sys.exit(0)
+          sys.exit("No iPad simulator is available")
+          ')
+          cd "$source"
+          xcodebuild -scheme AIWorkbookKit -destination "platform=iOS Simulator,id=$device_id" \
+            -derivedDataPath "$scratch/derived" -parallel-testing-enabled NO \
+            CODE_SIGNING_ALLOWED=NO test
