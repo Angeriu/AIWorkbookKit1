@@ -102,11 +102,14 @@ final class WorkbookPDFExportTests: XCTestCase {
     }
 
     private static func magentaInk() -> PKDrawing {
-        let points = (0..<8).map { index in
-            PKStrokePoint(location: CGPoint(x: 540 + 19 * index, y: 840 + 9 * index),
-                          timeOffset: TimeInterval(index) / 20,
-                          size: CGSize(width: 23, height: 23), opacity: 1, force: 1,
-                          azimuth: 0, altitude: .pi / 2)
+        let size = CGSize(width: 23, height: 23)
+        var points: [PKStrokePoint] = []
+        for index in 0..<8 {
+            let location = CGPoint(x: CGFloat(540 + 19 * index), y: CGFloat(840 + 9 * index))
+            let time = TimeInterval(index) / 20
+            let point = PKStrokePoint(location: location, timeOffset: time, size: size,
+                                      opacity: 1, force: 1, azimuth: 0, altitude: .pi / 2)
+            points.append(point)
         }
         let path = PKStrokePath(controlPoints: points, creationDate: Date())
         return PKDrawing(strokes: [PKStroke(ink: PKInk(.pen, color: .magenta), path: path)])
