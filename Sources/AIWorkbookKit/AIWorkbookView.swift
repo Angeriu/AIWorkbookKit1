@@ -103,7 +103,8 @@ public struct AIWorkbookView: View {
                 if let pdf, !currentFileName.isEmpty {
                     QuestionWorkspace(document: pdf,
                                       documentKey: currentFileName,
-                                      sourcePageIndex: pageIndex)
+                                      sourcePageIndex: pageIndex,
+                                      title: pdfDisplayNames[currentFileName] ?? "AI Workbook")
                         .id(currentFileName)
                 }
             }
