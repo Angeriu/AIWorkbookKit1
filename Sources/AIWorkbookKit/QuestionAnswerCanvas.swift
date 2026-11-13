@@ -99,12 +99,10 @@ private final class AnswerDrawingSnapshot {
 @MainActor
 private enum AnswerDrawingFiles {
     // Retain the latest unsaved drawing if its canvas is closed before a retry.
-    private static var pending: [URL: Data] = [:]
+    private static var pending: [URL: PKDrawing] = [:]
 
     static func read(_ url: URL) throws -> PKDrawing {
-        if let data = pending[url] {
-            return try PKDrawing(data: data)
-        }
+        if let drawing = pending[url] { return drawing }
 
         let data: Data
         do {
@@ -115,18 +113,19 @@ private enum AnswerDrawingFiles {
         return try PKDrawing(data: data)
     }
 
-    static func save(_ drawing: PKDrawing, to url: URL) throws {
-        pending[url] = drawing.dataRepresentation()
-        try flush(url)
+    static func stage(_ drawing: PKDrawing, for url: URL) {
+        pending[url] = drawing
     }
 
+    static func hasPendingDrawing(for url: URL) -> Bool { pending[url] != nil }
+
     static func flush(_ url: URL) throws {
-        guard let data = pending[url] else { return }
+        guard let drawing = pending[url] else { return }
         try FileManager.default.createDirectory(
             at: url.deletingLastPathComponent(),
             withIntermediateDirectories: true
         )
-        try data.write(to: url, options: .atomic)
+        try drawing.dataRepresentation().write(to: url, options: .atomic)
         pending.removeValue(forKey: url)
     }
 }
@@ -146,6 +145,9 @@ private struct AnswerCanvasHost: UIViewRepresentable {
     func makeUIView(context: Context) -> AnswerSheetScrollView {
         let view = AnswerSheetScrollView()
         view.canvas.drawing = snapshot.drawing
+        context.coordinator.onRender = { [weak view] canvas in
+            view?.canvasDidFinishRendering(canvas)
+        }
         view.canvas.delegate = context.coordinator
         view.attachPressurePen { [weak coordinator = context.coordinator] canvas in
             coordinator?.canvasViewDrawingDidChange(canvas)
@@ -155,15 +157,20 @@ private struct AnswerCanvasHost: UIViewRepresentable {
 
     func updateUIView(_ uiView: AnswerSheetScrollView, context: Context) {
         context.coordinator.onSave = onSave
+        let wasShowingTools = uiView.wantsTools
         uiView.setToolsVisible(showsTools)
+        if wasShowingTools && !showsTools {
+            context.coordinator.flushSave(from: uiView.canvas, reportsResult: true)
+        }
         uiView.fitWidthIfRequested(fitWidthRequest)
     }
 
     static func dismantleUIView(_ uiView: AnswerSheetScrollView, coordinator: Coordinator) {
         uiView.detachPressurePen()
         uiView.canvas.delegate = nil
+        coordinator.onRender = nil
         // A failed write stays queued and is retried when the answer sheet reopens.
-        try? coordinator.saveLatest(from: uiView.canvas)
+        coordinator.flushSave(from: uiView.canvas, reportsResult: false)
     }
 
     @MainActor
@@ -171,6 +178,8 @@ private struct AnswerCanvasHost: UIViewRepresentable {
         let fileURL: URL
         let snapshot: AnswerDrawingSnapshot
         var onSave: @MainActor (String?) -> Void
+        var onRender: ((PKCanvasView) -> Void)?
+        private let saveSchedule = DrawingSaveSchedule()
 
         init(fileURL: URL, snapshot: AnswerDrawingSnapshot, onSave: @escaping @MainActor (String?) -> Void) {
             self.fileURL = fileURL
@@ -179,22 +188,44 @@ private struct AnswerCanvasHost: UIViewRepresentable {
         }
 
         func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
-            do {
-                try saveLatest(from: canvasView)
-                onSave(nil)
-            } catch {
-                onSave(error.localizedDescription)
+            captureDrawing(from: canvasView)
+            guard AnswerDrawingFiles.hasPendingDrawing(for: fileURL) else { return }
+            saveSchedule.schedule { [weak self] in
+                guard let self else { return }
+                onSave(writePendingDrawing())
             }
         }
 
-        func saveLatest(from canvasView: PKCanvasView) throws {
-            let drawing = canvasView.drawing
-            guard drawing != snapshot.drawing else {
-                try AnswerDrawingFiles.flush(fileURL)
-                return
+        func canvasViewDidFinishRendering(_ canvasView: PKCanvasView) {
+            onRender?(canvasView)
+        }
+
+        func flushSave(from canvasView: PKCanvasView, reportsResult: Bool) {
+            saveSchedule.cancel()
+            captureDrawing(from: canvasView)
+            let error = writePendingDrawing()
+            if reportsResult {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, onRender != nil else { return }
+                    onSave(error)
+                }
             }
+        }
+
+        private func captureDrawing(from canvasView: PKCanvasView) {
+            let drawing = canvasView.drawing
+            guard drawing != snapshot.drawing else { return }
             snapshot.drawing = drawing
-            try AnswerDrawingFiles.save(drawing, to: fileURL)
+            AnswerDrawingFiles.stage(drawing, for: fileURL)
+        }
+
+        private func writePendingDrawing() -> String? {
+            do {
+                try AnswerDrawingFiles.flush(fileURL)
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
         }
     }
 }
@@ -207,7 +238,7 @@ private final class AnswerSheetScrollView: UIScrollView, UIScrollViewDelegate {
     private let pressurePen = WorkbookPressurePen()
     private var toolPicker: PKToolPicker { pressurePen.toolPicker }
     private var observingTools = false
-    private var wantsTools = false
+    private(set) var wantsTools = false
     private var viewportSize = CGSize.zero
     private var lastFitWidthRequest: Int?
 
@@ -307,6 +338,10 @@ private final class AnswerSheetScrollView: UIScrollView, UIScrollViewDelegate {
         pressurePen.detach()
     }
 
+    func canvasDidFinishRendering(_ canvasView: PKCanvasView) {
+        pressurePen.canvasDidFinishRendering(canvasView)
+    }
+
     func setToolsVisible(_ visible: Bool) {
         wantsTools = visible
         if visible {
@@ -366,4 +401,25 @@ final class WorkbookPencilCanvas: PKCanvasView {
     private let sheetUndoManager = UndoManager()
 
     override var undoManager: UndoManager? { sheetUndoManager }
+}
+
+@MainActor
+final class DrawingSaveSchedule {
+    private var task: Task<Void, Never>?
+
+    func schedule(_ save: @escaping @MainActor () -> Void) {
+        guard task == nil else { return }
+        // Allow Pencil input and the pending ink layer to reach the next frame before writing.
+        task = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(35))
+            guard let self, !Task.isCancelled else { return }
+            self.task = nil
+            save()
+        }
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+    }
 }

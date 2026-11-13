@@ -13,30 +13,38 @@ private enum PressurePenPreferences {
 @MainActor
 final class WorkbookPressurePen: NSObject, PKToolPickerObserver {
     private static let itemID = "aiworkbook.pressure-pen"
-    private static let estimatedProperties: UITouch.Properties = [.location, .force, .altitude, .azimuth]
 
     let toolPicker: PKToolPicker
     private weak var canvas: PKCanvasView?
     private var onDrawingChange: ((PKCanvasView) -> Void)?
     private var onStrokeActivity: ((Bool) -> Void)?
     private let gesture = PressurePenGesture(target: nil, action: nil)
-    private let overlay = PressurePenOverlay()
+    private var overlay = PressurePenOverlay()
     private var stroke: Stroke?
     private var finishTask: Task<Void, Never>?
-    private var clearOverlayTask: Task<Void, Never>?
+    private var handoffs: [InkHandoff] = []
+
+    private struct InkHandoff {
+        let id: UUID
+        let overlay: PressurePenOverlay
+        let fallback: Task<Void, Never>
+        let submittedAt: CFTimeInterval
+    }
 
     private struct Sample {
-        var location: CGPoint
+        let location: CGPoint
         let time: TimeInterval
         var force: CGFloat
         var altitude: CGFloat
         var azimuth: CGFloat
 
         @MainActor
-        init(touch: UITouch, in view: UIView) {
+        init(touch: UITouch, in view: UIView, previousForce: CGFloat?) {
             location = touch.preciseLocation(in: view)
             time = touch.timestamp
-            force = touch.force
+            let measuredForce = touch.force
+            force = measuredForce == 0 && touch.estimatedPropertiesExpectingUpdates.contains(.force)
+                ? previousForce ?? 0 : measuredForce
             altitude = touch.altitudeAngle
             azimuth = touch.azimuthAngle(in: view)
         }
@@ -52,31 +60,27 @@ final class WorkbookPressurePen: NSObject, PKToolPickerObserver {
         var pendingEstimates: [NSNumber: Int] = [:]
         var isActive = true
 
+        var previewCount: Int { samples.count + predictions.count }
+
         func width(forForce force: CGFloat) -> CGFloat {
-            // UIKit's nominal writing force is 1.0. Map it to the base width.
-            let normalized = max(0, force) / (1 + max(0, force))
-            return baseWidth * (1 + sensitivity * (normalized - 0.5) * 1.65)
+            let force = force.isFinite ? max(0, force) : 0
+            let response = force / (force + 0.45)
+            let relativeWidth = 1 + sensitivity * (response - 0.55) * 2.2
+            return baseWidth * max(0.30, relativeWidth)
         }
 
-        func widths(for samples: [Sample], taperEnd: Bool) -> [CGFloat] {
-            let widths = samples.indices.map { index in
-                let before = samples[max(samples.startIndex, index - 1)].force
-                let after = samples[min(samples.count - 1, index + 1)].force
-                return width(forForce: (before + samples[index].force * 2 + after) / 4)
+        func node(at index: Int) -> PressureInkNode {
+            if index >= samples.count {
+                return PressureInkNode(location: predictions[index - samples.count].location,
+                                       width: confirmedWidth(at: samples.count - 1))
             }
-            var distances: [CGFloat] = [0]
-            for index in samples.indices.dropFirst() {
-                let previous = samples[index - 1].location
-                let point = samples[index].location
-                distances.append(distances[index - 1] + hypot(point.x - previous.x, point.y - previous.y))
-            }
-            guard let length = distances.last, length > 6 else { return widths }
-            let taperLength = min(baseWidth * 2.5, length / 4)
-            return zip(widths, distances).map { width, distance in
-                let start = 0.82 + 0.18 * min(distance / taperLength, 1)
-                let end = taperEnd ? 0.72 + 0.28 * min((length - distance) / taperLength, 1) : 1
-                return width * start * end
-            }
+            return PressureInkNode(location: samples[index].location, width: confirmedWidth(at: index))
+        }
+
+        private func confirmedWidth(at index: Int) -> CGFloat {
+            let force = samples[index].force
+            let previous = samples[max(0, index - 1)].force
+            return width(forForce: force * 0.85 + previous * 0.15)
         }
     }
 
@@ -95,10 +99,6 @@ final class WorkbookPressurePen: NSObject, PKToolPickerObserver {
         gesture.pen = self
         gesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
         gesture.cancelsTouchesInView = false
-        overlay.isUserInteractionEnabled = false
-        overlay.isAccessibilityElement = false
-        overlay.isOpaque = false
-        overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
     }
 
     func attach(to canvas: PKCanvasView,
@@ -109,8 +109,6 @@ final class WorkbookPressurePen: NSObject, PKToolPickerObserver {
         self.onDrawingChange = onDrawingChange
         self.onStrokeActivity = onStrokeActivity
         canvas.overrideUserInterfaceStyle = .light
-        overlay.frame = canvas.bounds
-        canvas.addSubview(overlay)
         canvas.addGestureRecognizer(gesture)
         toolPicker.addObserver(self)
         toolPickerSelectedToolItemDidChange(toolPicker)
@@ -118,11 +116,11 @@ final class WorkbookPressurePen: NSObject, PKToolPickerObserver {
 
     func detach() {
         flush()
-        clearOverlayTask?.cancel()
-        clearOverlayTask = nil
+        clearHandoffs()
         overlay.clear()
         canvas?.undoManager?.removeAllActions(withTarget: self)
         canvas?.isDrawingEnabled = true
+        canvas?.drawingGestureRecognizer.isEnabled = true
         canvas?.removeGestureRecognizer(gesture)
         overlay.removeFromSuperview()
         toolPicker.removeObserver(self)
@@ -140,7 +138,9 @@ final class WorkbookPressurePen: NSObject, PKToolPickerObserver {
         let usesPressurePen = toolPicker.selectedToolItem.identifier == Self.itemID
         if !usesPressurePen { flush() }
         // Keep the initial canvas consistent even before its picker observation starts.
-        canvas?.isDrawingEnabled = !usesPressurePen && toolPicker.selectedToolItem.tool != nil
+        let usesNativeDrawing = !usesPressurePen && toolPicker.selectedToolItem.tool != nil
+        canvas?.isDrawingEnabled = usesNativeDrawing
+        canvas?.drawingGestureRecognizer.isEnabled = usesNativeDrawing
         gesture.isEnabled = usesPressurePen
     }
 
@@ -149,8 +149,7 @@ final class WorkbookPressurePen: NSObject, PKToolPickerObserver {
               let item = toolPicker.selectedToolItem as? PKToolPickerCustomItem,
               item.identifier == Self.itemID else { return false }
         flush()
-        clearOverlayTask?.cancel()
-        clearOverlayTask = nil
+        canvas.drawingGestureRecognizer.isEnabled = false
         let defaults = UserDefaults.standard
         let sensitivity = defaults.object(forKey: PressurePenPreferences.sensitivityKey) as? Double
             ?? PressurePenPreferences.defaultSensitivity
@@ -162,7 +161,8 @@ final class WorkbookPressurePen: NSObject, PKToolPickerObserver {
                         color: item.color.resolvedColor(with: UITraitCollection(userInterfaceStyle: .light)),
                         baseWidth: width,
                         sensitivity: CGFloat(min(max(sensitivity, 0), 1)))
-        canvas.bringSubviewToFront(overlay)
+        overlay.frame = canvas.bounds
+        canvas.addSubview(overlay)
         onStrokeActivity?(true)
         addSamples(for: touch, event: event, predicts: true)
         return true
@@ -176,12 +176,11 @@ final class WorkbookPressurePen: NSObject, PKToolPickerObserver {
         guard stroke?.isActive == true else { return }
         addSamples(for: touch, event: event, predicts: false)
         stroke?.isActive = false
-        renderPreview()
         onStrokeActivity?(false)
         finishIfReady()
         if stroke != nil {
             finishTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(45))
+                try? await Task.sleep(for: .milliseconds(16))
                 guard !Task.isCancelled else { return }
                 self?.commitStroke()
             }
@@ -192,68 +191,75 @@ final class WorkbookPressurePen: NSObject, PKToolPickerObserver {
         guard stroke?.isActive == true else { return }
         stroke = nil
         overlay.clear()
+        overlay.removeFromSuperview()
         onStrokeActivity?(false)
     }
 
     fileprivate func updateEstimates(_ touches: Set<UITouch>) {
         guard let canvas, stroke != nil else { return }
+        var dirtyFrom: Int?
         for touch in touches {
             guard let key = touch.estimationUpdateIndex,
                   let index = stroke?.pendingEstimates[key] else { continue }
             let expecting = touch.estimatedPropertiesExpectingUpdates
-            if !expecting.contains(.location), stroke?.isActive == true {
-                stroke?.samples[index].location = touch.preciseLocation(in: canvas)
-            }
             if !expecting.contains(.force) { stroke?.samples[index].force = touch.force }
             if !expecting.contains(.altitude) { stroke?.samples[index].altitude = touch.altitudeAngle }
             if !expecting.contains(.azimuth) { stroke?.samples[index].azimuth = touch.azimuthAngle(in: canvas) }
-            if expecting.isDisjoint(with: Self.estimatedProperties) {
+            if !expecting.contains(.force) {
                 stroke?.pendingEstimates.removeValue(forKey: key)
             }
+            dirtyFrom = min(dirtyFrom ?? index, index)
         }
-        renderPreview()
+        if let dirtyFrom { renderPreview(from: dirtyFrom) }
         finishIfReady()
     }
 
     private func addSamples(for touch: UITouch, event: UIEvent, predicts: Bool) {
         guard let canvas, stroke?.isActive == true else { return }
+        let oldCount = stroke?.samples.count ?? 0
         let coalesced = event.coalescedTouches(for: touch) ?? []
-        for sampleTouch in coalesced.isEmpty ? [touch] : coalesced {
-            let sample = Sample(touch: sampleTouch, in: canvas)
+        for sampleTouch in coalesced + [touch] {
+            let sample = Sample(touch: sampleTouch, in: canvas, previousForce: stroke?.samples.last?.force)
             if let last = stroke?.samples.last, sample.time <= last.time { continue }
+            if !predicts, sampleTouch.phase == .ended,
+               let last = stroke?.samples.last,
+               hypot(last.location.x - sample.location.x, last.location.y - sample.location.y) < 0.15 { continue }
             let index = stroke?.samples.count ?? 0
             stroke?.samples.append(sample)
             if let key = sampleTouch.estimationUpdateIndex,
-               !sampleTouch.estimatedPropertiesExpectingUpdates.isDisjoint(with: Self.estimatedProperties) {
+               sampleTouch.estimatedPropertiesExpectingUpdates.contains(.force) {
                 stroke?.pendingEstimates[key] = index
             }
         }
         let predictions = predicts ? event.predictedTouches(for: touch) ?? [] : []
-        stroke?.predictions = predictions.map { Sample(touch: $0, in: canvas) }
-        if predicts { renderPreview() }
+        let latest = stroke?.samples.last
+        stroke?.predictions = predictions.lazy.filter { $0.timestamp > (latest?.time ?? touch.timestamp) }
+            .prefix(3).map { Sample(touch: $0, in: canvas, previousForce: latest?.force) }
+        renderPreview(from: oldCount)
     }
 
-    private func renderPreview() {
+    private func renderPreview(from dirtyFrom: Int) {
         guard let stroke else { return }
-        let samples = stroke.samples + stroke.predictions
-        overlay.display(points: samples.map(\.location),
-                        widths: stroke.widths(for: samples, taperEnd: !stroke.isActive),
-                        color: stroke.color)
+        overlay.display(count: stroke.previewCount, dirtyFrom: dirtyFrom,
+                        color: stroke.color, nodeAt: stroke.node(at:))
     }
 
     private func finishIfReady() {
-        if let stroke, !stroke.isActive, stroke.pendingEstimates.isEmpty { commitStroke() }
+        if let stroke, !stroke.isActive,
+           stroke.pendingEstimates.isEmpty { commitStroke() }
     }
 
     private func commitStroke() {
         finishTask?.cancel()
         finishTask = nil
-        guard let stroke else { return }
+        guard var stroke else { return }
         self.stroke = nil
         guard let canvas, let first = stroke.samples.first else { return }
-        let widths = stroke.widths(for: stroke.samples, taperEnd: true)
-        var points = zip(stroke.samples, widths).map { sample, width in
-            PKStrokePoint(location: sample.location, timeOffset: sample.time - first.time,
+        stroke.predictions.removeAll()
+        var points = stroke.samples.indices.map { index in
+            let sample = stroke.samples[index]
+            let width = stroke.node(at: index).width
+            return PKStrokePoint(location: sample.location, timeOffset: sample.time - first.time,
                           size: CGSize(width: width, height: width), opacity: 1,
                           force: sample.force, azimuth: sample.azimuth, altitude: sample.altitude)
         }
@@ -269,20 +275,49 @@ final class WorkbookPressurePen: NSObject, PKToolPickerObserver {
         let path = PKStrokePath(controlPoints: points, creationDate: stroke.startedAt)
         let ink = PKInk(.pen, color: stroke.color)
         let penStroke = PKStroke(ink: ink, path: path)
-        overlay.display(points: stroke.samples.map(\.location), widths: widths, color: stroke.color)
-        replaceDrawing(canvas.drawing.appending(PKDrawing(strokes: [penStroke])))
-
-        // Keep the live ink visible for one brief tile-rendering handoff.
-        clearOverlayTask?.cancel()
-        clearOverlayTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .milliseconds(40))
+        overlay.display(count: stroke.samples.count, dirtyFrom: stroke.samples.count,
+                        color: stroke.color, nodeAt: stroke.node(at:))
+        let id = UUID()
+        let fallback = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(72))
             guard !Task.isCancelled else { return }
-            self?.overlay.clear()
+            self?.finishHandoff(id)
+        }
+        handoffs.append(InkHandoff(id: id, overlay: overlay, fallback: fallback,
+                                    submittedAt: CACurrentMediaTime()))
+        overlay = PressurePenOverlay()
+        replaceDrawing(canvas.drawing.appending(PKDrawing(strokes: [penStroke])), keepsHandoffs: true)
+    }
+
+    func canvasDidFinishRendering(_ canvas: PKCanvasView) {
+        guard canvas === self.canvas else { return }
+        // A callback can also be for earlier tiles or scrolling. Keep the most
+        // recent submission visible for at least one display frame in that case.
+        let refreshRate = max(60, canvas.window?.screen.maximumFramesPerSecond ?? 60)
+        let cutoff = CACurrentMediaTime() - 1 / Double(refreshRate)
+        for id in handoffs.filter({ $0.submittedAt <= cutoff }).map(\.id) {
+            finishHandoff(id)
         }
     }
 
-    private func replaceDrawing(_ drawing: PKDrawing) {
+    private func finishHandoff(_ id: UUID) {
+        guard let index = handoffs.firstIndex(where: { $0.id == id }) else { return }
+        let handoff = handoffs.remove(at: index)
+        handoff.fallback.cancel()
+        handoff.overlay.removeFromSuperview()
+    }
+
+    private func clearHandoffs() {
+        for handoff in handoffs {
+            handoff.fallback.cancel()
+            handoff.overlay.removeFromSuperview()
+        }
+        handoffs.removeAll()
+    }
+
+    private func replaceDrawing(_ drawing: PKDrawing, keepsHandoffs: Bool = false) {
         guard let canvas else { return }
+        if !keepsHandoffs { clearHandoffs() }
         let previous = canvas.drawing
         if let undo = canvas.undoManager {
             undo.disableUndoRegistration()
@@ -376,47 +411,143 @@ private final class PressurePenGesture: UIGestureRecognizer {
     override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool { false }
 }
 
+private struct PressureInkNode {
+    let location: CGPoint
+    let width: CGFloat
+}
+
 @MainActor
 private final class PressurePenOverlay: UIView {
-    override class var layerClass: AnyClass { CAShapeLayer.self }
+    private static let segmentsPerLayer = 32
+    private var inkLayers: [CAShapeLayer] = []
 
-    private var inkLayer: CAShapeLayer { layer as! CAShapeLayer }
+    init() {
+        super.init(frame: .zero)
+        isUserInteractionEnabled = false
+        isAccessibilityElement = false
+        isOpaque = false
+        layer.allowsGroupOpacity = true
+        autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    }
 
-    func display(points: [CGPoint], widths: [CGFloat], color: UIColor) {
-        let shape = CGMutablePath()
-        for index in points.indices {
-            let point = points[index]
-            let radius = widths[index] / 2
-            shape.move(to: CGPoint(x: point.x + radius, y: point.y))
-            shape.addArc(center: point, radius: radius, startAngle: 0, endAngle: -.pi, clockwise: true)
-            shape.addArc(center: point, radius: radius, startAngle: -.pi, endAngle: -.pi * 2, clockwise: true)
-            shape.closeSubpath()
-            guard index > 0 else { continue }
-            let previous = points[index - 1]
-            let length = hypot(point.x - previous.x, point.y - previous.y)
-            guard length > 0 else { continue }
-            let normal = CGVector(dx: (previous.y - point.y) / length, dy: (point.x - previous.x) / length)
-            let previousRadius = widths[index - 1] / 2
-            shape.move(to: CGPoint(x: previous.x + normal.dx * previousRadius,
-                                   y: previous.y + normal.dy * previousRadius))
-            shape.addLine(to: CGPoint(x: point.x + normal.dx * radius, y: point.y + normal.dy * radius))
-            shape.addLine(to: CGPoint(x: point.x - normal.dx * radius, y: point.y - normal.dy * radius))
-            shape.addLine(to: CGPoint(x: previous.x - normal.dx * previousRadius,
-                                      y: previous.y - normal.dy * previousRadius))
-            shape.closeSubpath()
-        }
+    required init?(coder: NSCoder) { fatalError("PressurePenOverlay is created in code") }
+
+    func display(count: Int, dirtyFrom: Int, color: UIColor, nodeAt: (Int) -> PressureInkNode) {
+        guard count > 0 else { clear(); return }
+        let segmentCount = count - 1
+        let requiredLayers = max(1, (segmentCount + Self.segmentsPerLayer - 1) / Self.segmentsPerLayer)
+        // Centerline tangents depend on two neighboring points. Repaint only their chunks.
+        let firstDirtyLayer = min(requiredLayers - 1, max(0, dirtyFrom - 2) / Self.segmentsPerLayer)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        inkLayer.fillColor = color.cgColor
-        inkLayer.path = shape
+        layer.opacity = Float(color.cgColor.alpha)
+        while inkLayers.count > requiredLayers { inkLayers.removeLast().removeFromSuperlayer() }
+        while inkLayers.count < requiredLayers {
+            let inkLayer = CAShapeLayer()
+            inkLayer.contentsScale = max(1, traitCollection.displayScale)
+            inkLayer.fillColor = color.withAlphaComponent(1).cgColor
+            layer.addSublayer(inkLayer)
+            inkLayers.append(inkLayer)
+        }
+
+        for index in firstDirtyLayer..<requiredLayers {
+            let start = index * Self.segmentsPerLayer
+            let end = min(segmentCount, start + Self.segmentsPerLayer + 1)
+            let outline = Self.outline(from: start, to: end, count: count, nodeAt: nodeAt)
+            let frame = outline.boundingBoxOfPath.insetBy(dx: -1, dy: -1).integral
+            var offset = CGAffineTransform(translationX: -frame.minX, y: -frame.minY)
+            let inkLayer = inkLayers[index]
+            inkLayer.frame = frame
+            inkLayer.path = outline.copy(using: &offset)
+        }
         CATransaction.commit()
     }
 
     func clear() {
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        inkLayer.path = nil
-        CATransaction.commit()
+        for inkLayer in inkLayers { inkLayer.removeFromSuperlayer() }
+        inkLayers.removeAll()
+    }
+
+    private static func outline(from start: Int, to end: Int, count: Int,
+                                nodeAt: (Int) -> PressureInkNode) -> CGPath {
+        let shape = CGMutablePath()
+        let first = nodeAt(start)
+        if start == end {
+            let radius = first.width / 2
+            shape.addEllipse(in: CGRect(x: first.location.x - radius, y: first.location.y - radius,
+                                        width: first.width, height: first.width))
+            return shape
+        }
+
+        var left: [CGPoint] = []
+        var right: [CGPoint] = []
+        for index in start..<end {
+            let first = nodeAt(index)
+            let second = nodeAt(index + 1)
+            let previous = index > 0 ? nodeAt(index - 1) : extrapolate(from: first, awayFrom: second)
+            let next = index + 2 < count ? nodeAt(index + 2) : extrapolate(from: second, awayFrom: first)
+            for subdivision in 0...4 where subdivision > 0 || index == start {
+                let t = CGFloat(subdivision) / 4
+                let curve = spline(previous.location, first.location, second.location, next.location, t: t)
+                let dx = curve.tangent.x
+                let dy = curve.tangent.y
+                let length = hypot(dx, dy)
+                if length < 0.0001, !left.isEmpty { continue }
+                let width = spline(previous.width, first.width, second.width, next.width, t: t).value
+                let radius = max(0.1, width / 2)
+                let normal = length >= 0.0001 ? CGPoint(x: -dy / length, y: dx / length) : CGPoint(x: 0, y: 1)
+                left.append(CGPoint(x: curve.point.x + normal.x * radius, y: curve.point.y + normal.y * radius))
+                right.append(CGPoint(x: curve.point.x - normal.x * radius, y: curve.point.y - normal.y * radius))
+            }
+        }
+
+        if let point = left.first {
+            shape.move(to: point)
+            for point in left.dropFirst() { shape.addLine(to: point) }
+            for point in right.reversed() { shape.addLine(to: point) }
+            shape.closeSubpath()
+        }
+        if start == 0, let leftEdge = left.first, let rightEdge = right.first {
+            addCap(to: shape, left: leftEdge, right: rightEdge)
+        }
+        if end == count - 1, let leftEdge = left.last, let rightEdge = right.last {
+            addCap(to: shape, left: leftEdge, right: rightEdge)
+        }
+        return shape
+    }
+
+    private static func addCap(to shape: CGMutablePath, left: CGPoint, right: CGPoint) {
+        let center = CGPoint(x: (left.x + right.x) / 2, y: (left.y + right.y) / 2)
+        let radius = hypot(left.x - right.x, left.y - right.y) / 2
+        shape.move(to: CGPoint(x: center.x + radius, y: center.y))
+        shape.addArc(center: center, radius: radius, startAngle: 0, endAngle: -.pi, clockwise: true)
+        shape.addArc(center: center, radius: radius, startAngle: -.pi, endAngle: -2 * .pi, clockwise: true)
+        shape.closeSubpath()
+    }
+
+    private static func extrapolate(from end: PressureInkNode, awayFrom next: PressureInkNode) -> PressureInkNode {
+        PressureInkNode(location: CGPoint(x: 2 * end.location.x - next.location.x,
+                                         y: 2 * end.location.y - next.location.y),
+                        width: 2 * end.width - next.width)
+    }
+
+    private static func spline(_ a: CGPoint, _ b: CGPoint, _ c: CGPoint, _ d: CGPoint,
+                               t: CGFloat) -> (point: CGPoint, tangent: CGPoint) {
+        let x = spline(a.x, b.x, c.x, d.x, t: t)
+        let y = spline(a.y, b.y, c.y, d.y, t: t)
+        return (CGPoint(x: x.value, y: y.value), CGPoint(x: x.slope, y: y.slope))
+    }
+
+    private static func spline(_ a: CGFloat, _ b: CGFloat, _ c: CGFloat, _ d: CGFloat,
+                               t: CGFloat) -> (value: CGFloat, slope: CGFloat) {
+        // Evaluate the cubic B-spline between two consecutive PencilKit control points.
+        let constant = (a + 4 * b + c) / 6
+        let linear = (c - a) / 2
+        let quadratic = (a - 2 * b + c) / 2
+        let cubic = (d - a + 3 * (b - c)) / 6
+        let value = constant + t * (linear + t * (quadratic + t * cubic))
+        let slope = linear + t * (2 * quadratic + t * 3 * cubic)
+        return (value, slope)
     }
 }
 
